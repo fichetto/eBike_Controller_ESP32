@@ -9,7 +9,9 @@ DA IMPLEMENTARE:
 
 
 Implementati:
-Rev17 - 20220226 - Mappatura dei livelli di assistenza, rimozione errore della divisione per zero, utilizzo dell'acceleratore per aumentare il livello di assistenza a comando (solo x papà con scheda modificata, il piedino 18 è stato spostato al 27)
+Rev18 - 20231221 - Porting in PlatformIO - Eliminazione del preprocessore - Correzione in Timeutility.h dove mancava un return - (Pare che ora funzioni)
+
+Rev17 - 20230226 - Mappatura dei livelli di assistenza, rimozione errore della divisione per zero, utilizzo dell'acceleratore per aumentare il livello di assistenza a comando (solo x papà con scheda modificata, il piedino 18 è stato spostato al 27)
 
 rev16
 	-Valori mappatura Wh batteria aggiornati
@@ -98,7 +100,7 @@ rev1
 
 
 
-
+#include <Arduino.h>
 #include <Adafruit_SH1106.h>	//NB: La libreria utilizzata per la esp32 � diversa da quella per arduino 
 #include <TimeUtility.h>
 #include <Adafruit_GFX.h>
@@ -186,309 +188,6 @@ volatile float AssistLevelFLoat[6] = { 0.0f,1.0f,1.5f,2.0f,3.0f, 5.0f };
 volatile float AssistComposed;
 
 
-void setup()
-{
-	Serial.begin(115200);
-	setCpuFrequencyMhz(80);
-
-	xTaskCreatePinnedToCore(
-		Task1code, /* Function to implement the task */
-		"Task1", /* Name of the task */
-		10000,  /* Stack size in words */
-		NULL,  /* Task input parameter */
-		0,  /* Priority of the task */
-		&Task1,  /* Task handle. */
-		0); /* Core where the task should run */
-
-#if TORQUE_SENSOR_EN == 1
-	pinMode(pinPAS_mvc, INPUT);
-	pinMode(pinBtn, INPUT_PULLDOWN);
-	attachInterrupt(digitalPinToInterrupt(pinPAS_mvc), RilevaPedalata, FALLING);
-#else
-	pinMode(Hall1, INPUT_PULLUP);
-	pinMode(Hall2, INPUT_PULLUP);
-	pinMode(pinBypassPed, INPUT_PULLUP);
-	attachInterrupt(digitalPinToInterrupt(Hall2), RilevaPedalata, FALLING);
-#endif 
-
-	timerAccel.setInterval(TimeBaseAccel);
-	timerButton.setTimer(400);
-	timerSpecialBttFunction.setTimer(10000);
-	timerPotCalibration.setTimer(20000);
-
-	EEPROM.begin(EEPROM_SIZE);
-	MinPot = EEPROM.readInt(0);
-	MaxPot = EEPROM.readInt(4);
-	SensorON = EEPROM.readBool(8);
-}
-
-
-int testcount;
-bool flagLongPressedBtt = false;
-bool Button = 0;
-bool flagPressedBtt = 0;
-int CountBttSpecialFunction;
-bool ManualThrottle = false;		//flag che attiva il motore anche in assenza di pedalata, tramite pressione prolungata del tasto (tranne in modalit� torque sensor)
-
-void loop()
-{
-
-#if TORQUE_SENSOR_EN == 0
-	ADCrawValue = analogRead(pinPot);
-
-	if (ADCrawValue <= MaxPot + 200)	//Aggiorna FilteredADC (utilizzata per l'output vesc) solo se il pulsante non � premuto, diversamente ritiene il valore precedente.
-	{
-		FilteredADCvalue = FilterADC(ADCrawValue);
-		percentPot = constrain((map(FilteredADCvalue, MinPot, MaxPot - 100, 0, 100)), 0, 100);
-		Button = false;		//Quando il pulsante viene rilasciato, resetto il suo stato
-	}
-	else if (ADCrawValue > maxValueADC - 200)
-	{
-		Button = true;		//Pulsante premuto
-		delay(50);			//delay come filtro per evitare ulteriori avanzamenti di pagina indesiderati
-	}
-
-
-	//-----------------BUTTON---------------------------------------
-	if (Button == true)
-	{
-		flagPressedBtt = true;
-		timerButton.startTimer();
-		if (timerButton.checkTimer() == true)		//Pressione prolungata
-		{
-			ManualThrottle = true;
-			timerButton.resetTimer();
-			flagLongPressedBtt = true;
-		}
-	}
-
-	if (Button == false && flagPressedBtt == true)
-	{
-		flagPressedBtt = false;
-		if (flagLongPressedBtt == false)			//pressionebreve: se non � avvenuta la pressione prolungata allora rilevo quella breve
-		{
-			CountBttSpecialFunction++;
-			pagina++;
-			timerSpecialBttFunction.startTimer();		//timeout per conteggio pressioni pulsante per selezionare la modalit� di bypass pedalata
-			//premendo 10 volte spegne o attiva il sensore di pedalata:
-			//quando � OFF, la pressione lunga sul tasto attiva la trazione con valore di corrente in base al potenziometro
-			//quando � ON, la pressione prolungata attiva la trazione con valore massimo (boost)
-			if (CountBttSpecialFunction == 10)
-			{
-				SensorON = !SensorON;
-				EEPROM.writeBool(8, SensorON);
-				EEPROM.commit();
-				pagina = 20;
-			}
-			if (CountBttSpecialFunction == 25)
-			{
-				pagina = 31;					//pagina di setup min max potenziometro
-				//flagPotCalibration = true;		//flag che attiva funzione di memorizzazione min max
-				potCalibrationRoutine();
-
-			}
-			if (CountBttSpecialFunction > 35)
-			{
-				ESP.restart();
-			}
-		}
-		timerButton.resetTimer();
-		ManualThrottle = false;
-		flagLongPressedBtt = false;
-	}
-
-	if (timerSpecialBttFunction.checkTimer() == true)
-	{
-		CountBttSpecialFunction = 0;
-		timerSpecialBttFunction.resetTimer();
-	}
-
-
-	/*Rileva pedalata e calcolo dell'output
-	Vengono eseguiti solo se ADCvalue � superiore a 0 ovvero quando il potenziometro non � a 0 oppure viene premuto il pulsante
-	*/
-	if (Drive_0_100 > 5 || ManualThrottle == true)
-	{
-		if (SensorON == true)		//Se il sensore pedalata non � spento, utilizza la logica di funzionamento normale. 
-		{
-			if (flagHall != prevValueHall)
-			{
-				unsigned long deltamillis = millis() - prevmillisHall;
-				RpmPedaling = 60000 / (deltamillis * NumeroMagneti);
-				prevmillisHall = millis();
-				prevValueHall = flagHall;
-				timeout = deltamillis * 2;
-				if (flagSecondoSegnale == true)
-				{
-					AbilitaTrazione = true;
-				}
-				flagSecondoSegnale = true;
-			}
-			else if (RpmPedaling != 0 && flagHall == prevValueHall && millis() > (prevmillisHall + timeout))
-			{
-				AbilitaTrazione = false;
-				RpmPedaling = 0;
-				flagSecondoSegnale = false;
-			}
-			else if (RpmPedaling != 0 && flagHall == prevValueHall && millis() > (prevmillisHall + 1500))
-			{
-				AbilitaTrazione = false;
-				RpmPedaling = 0;
-				flagSecondoSegnale = false;
-			}
-		}
-		else								//Se il sensore � spento utilizzo l'accelerazione tramite pulsante.
-		{
-			if (ManualThrottle == true)
-			{
-				AbilitaTrazione = true;
-			}
-			else
-			{
-				AbilitaTrazione = false;
-			}
-		}
-
-
-		// --- Calcolo output ---
-		if (AbilitaTrazione == true)
-		{
-			current = map(Drive_0_100, 0, 100, 0, CurrentMax * 1000.0f) / 1000.0f;
-			if (current >= CurrentMax) //constrain
-			{
-				current = CurrentMax;
-			}
-		}
-		else
-		{
-			current = 0.0f;
-		}
-		if (SensorON == true && ManualThrottle == true) //se il sensore pedalata � attivo e viene premuto il pulsante SX attivo il boost sovrascrivendo il valore
-		{
-			current = CurrentMax;
-		}
-
-		if (flagStop == false)	//se il blocco per batteria scarica non � attivo
-		{
-			outputUartCurrent = SmoothCurrent(current);
-		}
-		else
-		{
-			outputUartCurrent = 0.f;
-		}
-
-	}
-	else
-	{
-		outputUartCurrent = 0.f;
-	}
-
-#else
-
-	// --- Lettura coppia --- 
-	ADCrawValue = analogRead(pinTorque);
-	ADC_Throttle = analogRead(pinThrottle);
-	Serial.println(ADCrawValue);
-	FilteredADCvalue = FilterADC(ADCrawValue);
-	Drive_0_100 = constrain((map(FilteredADCvalue, MIN_TORQUE_ADC_VAL, MAX_TORQUE_ADC_VAL - 100, 0, 100)), 0, 100);
-	AssistComposed = map(ADC_Throttle, 1500, 4095, 0.0, 5.0);
-	if (AssistComposed < 0) {
-		AssistComposed = 0;
-	}
-	//voltage = map(voltage, 0, V_REF / 1000.0, 0, 5);
-	// --- Calcolo Rpm pedalata --- 
-	static int prevCounterPAS = 0;
-	unsigned long deltamillis = 0;
-	if (counterPAS > prevCounterPAS)
-	{
-		deltamillis = millis() - prevmillisHall;
-		if (deltamillis != 0) {
-			RpmPedaling = 60000 / (deltamillis * TICK_X_REVOLUTION_PAS);
-		}
-		prevmillisHall = millis();
-		timeout = deltamillis * 5;	//tempo di timeout che porta a 0 la cadenza 
-		prevCounterPAS = counterPAS;
-	}
-	else if (millis() > prevmillisHall + timeout)
-	{
-		RpmPedaling = 0;
-	}
-
-	// Calcolo la variazione di velocità della pedivella
-	static int prevRPMpedal = 0;
-	RpmPedVariation = RpmPedaling - prevRPMpedal;
-	prevRPMpedal = RpmPedaling;
-
-
-	// --- Calcolo output ---
-	if ( RpmPedaling > 7 || Drive_0_100 > TORQUE_TH)
-	//if (RpmPedVariation > 1 && Drive_0_100 > TORQUE_TH)
-	{
-		//current = (map(Drive_0_100, 0, 100, 0, CurrentMax * 1000.0f) / 1000.0f) * pow(AssistLevel, 1.2f) * 0.8; //(AssistLevel / QTY_ASSIST_LEVEL);
-		
-		
-		if (AssistComposed < AssistLevelFLoat[AssistLevel]) {
-			AssistComposed = AssistLevelFLoat[AssistLevel];
-		}
-
-		current = (map(Drive_0_100, 0, 100, 0, CurrentMax * 1000.0f) / 1000.0f) * AssistComposed * 0.8; //(AssistLevel / QTY_ASSIST_LEVEL);
-
-		if (current >= CurrentMax) //constrain
-		{
-			current = CurrentMax;
-		}
-	}
-	else
-	{
-		current = 0.0f;
-	}
-	outputUartCurrent = SmoothCurrent(current);
-
-	// --- Gestione pulsante ---
-	Button = digitalRead(pinBtn);
-	if (Button == true)
-	{
-		delay(50);	//filtro per evitare avanzamenti indesiderati di pagina
-		flagPressedBtt = true;
-		timerButton.startTimer();
-		if (timerButton.checkTimer() == true)		//Pressione prolungata
-		{
-			pagina++;
-			timerButton.resetTimer();
-			flagLongPressedBtt = true;
-		}
-	}
-
-	if (Button == false && flagPressedBtt == true)
-	{
-		flagPressedBtt = false;
-		if (flagLongPressedBtt == false)			//pressionebreve: se non � avvenuta la pressione prolungata allora rilevo quella breve
-		{
-			AssistLevel++;
-			if (AssistLevel > QTY_ASSIST_LEVEL)
-			{
-				AssistLevel = 0;
-			}
-			CountBttSpecialFunction++;
-			timerSpecialBttFunction.startTimer();		//timeout per conteggio pressioni pulsante per selezionare la modalit� di bypass pedalata
-			if (CountBttSpecialFunction > 35)
-			{
-				ESP.restart();
-			}
-		}
-		timerButton.resetTimer();
-		flagLongPressedBtt = false;
-	}
-
-	if (timerSpecialBttFunction.checkTimer() == true)
-	{
-		CountBttSpecialFunction = 0;
-		timerSpecialBttFunction.resetTimer();
-	}
-#endif
-}
-
-
 float incrementValue = AccelerationValue / (1000.0f / TimeBaseAccel);
 /*Gestisce la rampa di accelerazione per drive con potenziometro o di decelerazione per drive con sensore di coppia.
 Nel caso di sensore di coppia, questa funzione garantisce un'erogazione pi� uniforme in quanto durante la pedalata.
@@ -498,49 +197,7 @@ viene copiato il valore di corrente istantaneo calcolato a partire dal sensore;
 quando invece la coppia decresce viene applicata una rampa che mantiene parte dell'erogazione fino alla successiva spinta in pedalata.
 Gestisce anche gli eventuali valori fuori soglia*/
 float SmoothCurrent(float Value) {
-#if TORQUE_SENSOR_EN == 0
-	//Gestione rampa
-	if (Value > sendCurrent)
-	{
-		if (timerAccel.checkTime() == 1)
-		{
-			if (UART.data.avgMotorCurrent > 6.0f)		//se la corrente del motore � superiore ad un certo valore, evito la rampa di accelerazione
-			{
-				sendCurrent = Value;
-			}
-			else
-			{
-				float tmpsendCurrent = sendCurrent + incrementValue;	//questa variabile memorizza temporaneamente il valore incrementato che viene successivamente copiato nella variabile definitiva
-				if (tmpsendCurrent >= Value)
-				{
-					sendCurrent = Value;
-				}
-				else
-				{
-					sendCurrent = tmpsendCurrent;
-				}
-			}
 
-		}
-	}
-	else if (Value < sendCurrent)
-	{
-		sendCurrent = Value;
-	}
-
-	//Gestione valori fuori soglia
-	if (sendCurrent > CurrentMax)
-	{
-		sendCurrent = CurrentMax;
-	}
-	else if (sendCurrent < 0.0f)
-	{
-		sendCurrent = 0.0f;
-	}
-
-	return sendCurrent;
-
-#else	
 	float decrementValue = RpmPedaling / 70.f;		//proporzionale alla cadenza: aumentare il divisore per rallentare la rampa di diminuzione
 	//Gestione rampa 
 	if ((RpmPedaling < 7 || RpmPedVariation<-35) && Drive_0_100 < TORQUE_TH)
@@ -572,7 +229,7 @@ float SmoothCurrent(float Value) {
 	}
 
 	return sendCurrent;
-#endif // TORQUE_SENSOR_EN == 0
+
 }
 
 unsigned long sumADC;
@@ -592,6 +249,85 @@ unsigned int FilterADC(unsigned int Valore) {
 	return avg;
 }
 
+
+void drawIndicator(float radP, byte a, byte a1, float P1) {
+
+	//Vertice indicatore C
+	float cC = a * sin(radP);
+	float bC = a * cos(radP);
+	byte xC = 63 - bC;
+	byte yC = 63 - cC;
+
+	//Vertice base A
+	float cA = a1 * sin(radP + P1);
+	float bA = a1 * cos(radP + P1);
+	byte xA = 63 - bA;
+	byte yA = 63 - cA;
+
+	//Vertice base B
+	float cB = a1 * sin(radP - P1);
+	float bB = a1 * cos(radP - P1);
+	byte xB = 63 - bB;
+	byte yB = 63 - cB;
+
+	display.fillTriangle(xC, yC, xA, yA, xB, yB, WHITE);	//triangolino indicatore
+}
+
+void potCalibrationRoutine(void) {
+	delay(500);
+	timerPotCalibration.startTimer();
+	int temp = analogRead(pinPot);
+	int tempMinPot;
+	int tempMaxPot;
+	bool flagbttx = false;
+	while (!(timerPotCalibration.checkTimer()) && !flagbttx)
+	{
+		temp = analogRead(pinPot);	//controllo se � stato premuttoo il pulsante, in caso affermativo esco dal ciclo while
+		if (temp > maxValueADC - 500)
+		{
+			flagbttx = true;
+		}
+		FilteredADCvalue = FilterADC(temp);
+		if (timerPotCalibration.msPassed < 10000)
+		{
+			tempMinPot = FilteredADCvalue;
+		}
+
+		if (timerPotCalibration.msPassed > 10000)
+		{
+			MinPot = tempMinPot;	//trascorsi 10 sec, aggiorno gi� Minpot in modo che possa gi� essere visualizzato su display
+			tempMaxPot = FilteredADCvalue;
+		}
+	}
+	flagbttx = false;
+	if (timerPotCalibration.checkTimer() == true)
+	{
+		MaxPot = tempMaxPot;
+		EEPROM.writeInt(0, MinPot);
+		EEPROM.writeInt(4, MaxPot);
+		EEPROM.commit();
+		delay(1500);
+	}
+
+	//Memorizzazione in eeprom
+	timerPotCalibration.resetTimer();
+	pagina = 8;
+}
+
+/*La seguente funzione rileva il verso e la frequenza della pedalata.
+Il verso viene rilevato controllando il fonte di salita del sensore hall 2: se quest'ultimo avviene e il sensore 1 � gi� attivo, vuol dire che
+il senso di pedalata � orario e quindi in trazione*/
+void IRAM_ATTR RilevaPedalata() {
+	counterPAS++;
+#if TORQUE_SENSOR_EN == 0
+	if (digitalRead(Hall1) == false) {
+		flagHall = !flagHall;
+	}
+#endif
+
+}
+
+
 /*Interfaccia display + output vesc*/
 void Task1code(void* pvParameter) {
 
@@ -604,11 +340,11 @@ void Task1code(void* pvParameter) {
 	display.clearDisplay();
 	display.setTextSize(1);
 	display.setTextColor(WHITE);
-	display.setCursor(40, 10);
+	display.setCursor(30, 10);
 
-	display.print("rev16");
+	display.print("Revisione 18");
 	display.display();
-
+	delay(500);
 	int WhBatteryMap[] = { 0,25,50,75,100,200,400,530,670,820,940,1170,1200 };	//da 30V a 42V
 	byte percentBatt;
 
@@ -616,7 +352,6 @@ void Task1code(void* pvParameter) {
 
 		UART.setCurrent(outputUartCurrent);
 		UART.getVescValues();
-		//float testbatt = map(percentPot, 0, 100, 280, 420) / 10.f;
 		float TensioneBatt = ((TensioneBatt * 10.0f) - TensioneBatt + UART.data.inpVoltage) / 10.0f;		//filtro tensione 
 		//Serial.println(TensioneBatt);
 		if (TensioneBatt < CUTOFF_VOLTAGE)
@@ -664,7 +399,7 @@ void Task1code(void* pvParameter) {
 			display.print("V batt: ");
 			display.print(UART.data.inpVoltage);
 
-			display.setCursor(0, 56);
+			display.setCursor(0, 56); // Aggiuntadel throttle di papo
 			display.print("Duty: ");
 			display.print(UART.data.dutyCycleNow);
 
@@ -685,41 +420,6 @@ void Task1code(void* pvParameter) {
 			display.fillRect(0, 5, line2, 3, WHITE);
 
 			display.setTextSize(1);
-#if TORQUE_SENSOR_EN == 0
-			display.setCursor(0, 10);
-			display.print("Count Hall: ");
-			display.print(counterPAS);
-			display.setCursor(120, 10);
-			display.print(flagHall);
-
-			display.setCursor(0, 19);
-			display.print("RPM Ped: ");
-			display.print(RpmPedaling);
-
-			display.setCursor(0, 28);
-			display.print("WriteCurr: ");
-			display.print(outputUartCurrent);
-
-			display.setCursor(0, 37);
-			display.print("Motor Curr: ");
-			display.print(UART.data.avgMotorCurrent);
-
-			display.setCursor(0, 46);
-			display.print("Pot %: ");
-			display.print(Drive_0_100);
-
-			display.setCursor(0, 55);
-			display.print("ADCraw: ");
-			display.print(ADCrawValue);
-
-			display.setCursor(80, 55);
-			display.print(MinPot);
-
-			display.setCursor(102, 55);
-			display.print(MaxPot);
-
-			display.display();
-#else
 
 			display.setCursor(0, 10);
 			display.print("Count PAS: ");
@@ -750,7 +450,6 @@ void Task1code(void* pvParameter) {
 			display.print(AssistLevel);
 
 			display.display();
-#endif
 		}
 		else if (pagina == 7)
 		{
@@ -896,37 +595,15 @@ void Task1code(void* pvParameter) {
 			display.print("5");
 			display.setCursor(57, 45);
 			display.print("hW");
-#if TORQUE_SENSOR_EN == 0
-			display.setCursor(92, 0);
-			display.print("SENSOR");
-			display.setCursor(110, 8);
-			if (SensorON == true)
-			{
-				display.print("ON");
-			}
-			else
-			{
-				display.print("OFF");
-			}
-#else
+
 			display.setCursor(110, 0);
 			display.setTextSize(2);
 			display.print(AssistLevel);
-#endif
+
 
 			//INDICATORI
 			//Potenziometro
-#if TORQUE_SENSOR_EN == 0
-			float radP = map(Drive_0_100, 0, 100, 0, 314);
-			if (radP > 314) { radP = 314; }
-			radP = radP / 100.0f;
-			drawIndicator(radP, 62, 52, 0.07);
-			//#else
-			//			float radP = map(AssistLevel, 0, QTY_ASSIST_LEVEL, 0, 314);
-			//			if (radP > 314) { radP = 314; }
-			//			radP = radP / 100.0f;
-			//			drawIndicator(radP, 62, 52, 0.07);
-#endif // TORQUE_SENSOR_EN == 0
+
 
 			display.setTextSize(0);
 			//Ampere
@@ -1025,79 +702,150 @@ void Task1code(void* pvParameter) {
 	}
 }
 
-void drawIndicator(float radP, byte a, byte a1, float P1) {
 
-	//Vertice indicatore C
-	float cC = a * sin(radP);
-	float bC = a * cos(radP);
-	byte xC = 63 - bC;
-	byte yC = 63 - cC;
+void setup()
+{
+	Serial.begin(115200);
+	setCpuFrequencyMhz(80);
 
-	//Vertice base A
-	float cA = a1 * sin(radP + P1);
-	float bA = a1 * cos(radP + P1);
-	byte xA = 63 - bA;
-	byte yA = 63 - cA;
+	xTaskCreatePinnedToCore(
+		Task1code, /* Function to implement the task */
+		"Task1", /* Name of the task */
+		10000,  /* Stack size in words */
+		NULL,  /* Task input parameter */
+		0,  /* Priority of the task */
+		&Task1,  /* Task handle. */
+		0); /* Core where the task should run */
 
-	//Vertice base B
-	float cB = a1 * sin(radP - P1);
-	float bB = a1 * cos(radP - P1);
-	byte xB = 63 - bB;
-	byte yB = 63 - cB;
+	pinMode(pinPAS_mvc, INPUT);
+	pinMode(pinBtn, INPUT_PULLDOWN);
+	attachInterrupt(digitalPinToInterrupt(pinPAS_mvc), RilevaPedalata, FALLING);
 
-	display.fillTriangle(xC, yC, xA, yA, xB, yB, WHITE);	//triangolino indicatore
+
+	timerAccel.setInterval(TimeBaseAccel);
+	timerButton.setTimer(400);
+	timerSpecialBttFunction.setTimer(10000);
+	timerPotCalibration.setTimer(20000);
+
+	EEPROM.begin(EEPROM_SIZE);
+	MinPot = EEPROM.readInt(0);
+	MaxPot = EEPROM.readInt(4);
+	SensorON = EEPROM.readBool(8);
 }
 
-void potCalibrationRoutine(void) {
-	delay(500);
-	timerPotCalibration.startTimer();
-	int temp = analogRead(pinPot);
-	int tempMinPot;
-	int tempMaxPot;
-	bool flagbttx = false;
-	while (!(timerPotCalibration.checkTimer()) && !flagbttx)
+
+int testcount;
+bool flagLongPressedBtt = false;
+bool Button = 0;
+bool flagPressedBtt = 0;
+int CountBttSpecialFunction;
+bool ManualThrottle = false;		//flag che attiva il motore anche in assenza di pedalata, tramite pressione prolungata del tasto (tranne in modalit� torque sensor)
+
+void loop()
+{
+
+
+
+	// --- Lettura coppia --- 
+	ADCrawValue = analogRead(pinTorque);
+	ADC_Throttle = analogRead(pinThrottle);
+	Serial.println(ADCrawValue);
+	FilteredADCvalue = FilterADC(ADCrawValue);
+	Drive_0_100 = constrain((map(FilteredADCvalue, MIN_TORQUE_ADC_VAL, MAX_TORQUE_ADC_VAL - 100, 0, 100)), 0, 100);
+	AssistComposed = map(ADC_Throttle, 1500, 4095, 0.0, 5.0);
+	if (AssistComposed < 0) {
+		AssistComposed = 0;
+	}
+	//voltage = map(voltage, 0, V_REF / 1000.0, 0, 5);
+	// --- Calcolo Rpm pedalata --- 
+	static int prevCounterPAS = 0;
+	unsigned long deltamillis = 0;
+	if (counterPAS > prevCounterPAS)
 	{
-		temp = analogRead(pinPot);	//controllo se � stato premuttoo il pulsante, in caso affermativo esco dal ciclo while
-		if (temp > maxValueADC - 500)
-		{
-			flagbttx = true;
+		deltamillis = millis() - prevmillisHall;
+		if (deltamillis != 0) {
+			RpmPedaling = 60000 / (deltamillis * TICK_X_REVOLUTION_PAS);
 		}
-		FilteredADCvalue = FilterADC(temp);
-		if (timerPotCalibration.msPassed < 10000)
-		{
-			tempMinPot = FilteredADCvalue;
-		}
-
-		if (timerPotCalibration.msPassed > 10000)
-		{
-			MinPot = tempMinPot;	//trascorsi 10 sec, aggiorno gi� Minpot in modo che possa gi� essere visualizzato su display
-			tempMaxPot = FilteredADCvalue;
-		}
+		prevmillisHall = millis();
+		timeout = deltamillis * 5;	//tempo di timeout che porta a 0 la cadenza 
+		prevCounterPAS = counterPAS;
 	}
-	flagbttx = false;
-	if (timerPotCalibration.checkTimer() == true)
+	else if (millis() > prevmillisHall + timeout)
 	{
-		MaxPot = tempMaxPot;
-		EEPROM.writeInt(0, MinPot);
-		EEPROM.writeInt(4, MaxPot);
-		EEPROM.commit();
-		delay(1500);
+		RpmPedaling = 0;
 	}
 
-	//Memorizzazione in eeprom
-	timerPotCalibration.resetTimer();
-	pagina = 8;
-}
+	// Calcolo la variazione di velocità della pedivella
+	static int prevRPMpedal = 0;
+	RpmPedVariation = RpmPedaling - prevRPMpedal;
+	prevRPMpedal = RpmPedaling;
 
-/*La seguente funzione rileva il verso e la frequenza della pedalata.
-Il verso viene rilevato controllando il fonte di salita del sensore hall 2: se quest'ultimo avviene e il sensore 1 � gi� attivo, vuol dire che
-il senso di pedalata � orario e quindi in trazione*/
-void IRAM_ATTR RilevaPedalata() {
-	counterPAS++;
-#if TORQUE_SENSOR_EN == 0
-	if (digitalRead(Hall1) == false) {
-		flagHall = !flagHall;
+
+	// --- Calcolo output ---
+	if ( RpmPedaling > 7 || Drive_0_100 > TORQUE_TH)
+	//if (RpmPedVariation > 1 && Drive_0_100 > TORQUE_TH)
+	{
+		//current = (map(Drive_0_100, 0, 100, 0, CurrentMax * 1000.0f) / 1000.0f) * pow(AssistLevel, 1.2f) * 0.8; //(AssistLevel / QTY_ASSIST_LEVEL);
+		
+		
+		if (AssistComposed < AssistLevelFLoat[AssistLevel]) {
+			AssistComposed = AssistLevelFLoat[AssistLevel];
+		}
+
+		current = (map(Drive_0_100, 0, 100, 0, CurrentMax * 1000.0f) / 1000.0f) * AssistComposed * 0.8; //(AssistLevel / QTY_ASSIST_LEVEL);
+
+		if (current >= CurrentMax) //constrain
+		{
+			current = CurrentMax;
+		}
 	}
-#endif
+	else
+	{
+		current = 0.0f;
+	}
+	outputUartCurrent = SmoothCurrent(current);
+
+	// --- Gestione pulsante ---
+	Button = digitalRead(pinBtn);
+	if (Button == true)
+	{
+		delay(50);	//filtro per evitare avanzamenti indesiderati di pagina
+		flagPressedBtt = true;
+		timerButton.startTimer();
+		if (timerButton.checkTimer() == true)		//Pressione prolungata
+		{
+			pagina++;
+			timerButton.resetTimer();
+			flagLongPressedBtt = true;
+		}
+	}
+
+	if (Button == false && flagPressedBtt == true)
+	{
+		flagPressedBtt = false;
+		if (flagLongPressedBtt == false)			//pressionebreve: se non � avvenuta la pressione prolungata allora rilevo quella breve
+		{
+			AssistLevel++;
+			if (AssistLevel > QTY_ASSIST_LEVEL)
+			{
+				AssistLevel = 0;
+			}
+			CountBttSpecialFunction++;
+			timerSpecialBttFunction.startTimer();		//timeout per conteggio pressioni pulsante per selezionare la modalit� di bypass pedalata
+			if (CountBttSpecialFunction > 35)
+			{
+				ESP.restart();
+			}
+		}
+		timerButton.resetTimer();
+		flagLongPressedBtt = false;
+	}
+
+	if (timerSpecialBttFunction.checkTimer() == true)
+	{
+		CountBttSpecialFunction = 0;
+		timerSpecialBttFunction.resetTimer();
+	}
 
 }
+
